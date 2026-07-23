@@ -8,10 +8,15 @@ Enter your name and a room name — any string you like (no spaces) — and you'
 in. Share the room URL with anyone; everyone who joins the same room is
 connected to everyone else over a full WebRTC mesh, up to 8 people. You enter
 with your microphone and camera **off** and turn them on when you're ready.
+Click any tile to enlarge it (the rest shrink to a filmstrip); click it again
+or press Esc to return to the gallery.
 
 The room has shared settings that anyone can change and that apply to
 everyone — currently the video quality (low / medium / high / auto, medium by
-default). You can also share your screen in place of your camera.
+default). You can also share your screen in place of your camera, and there's
+a room chat (with join/left notices and clickable links) that is as ephemeral
+as the call itself: you only see what's said while you're in the room, and
+nothing is stored anywhere.
 
 ## How it works
 

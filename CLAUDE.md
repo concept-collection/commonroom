@@ -14,7 +14,10 @@ src/p2p/
   peer.ts      WebRTC wrapper: media + control channel    — ported (replaceTrack generalized to audio|video)
   settings.ts  shared ROOM settings, quality presets      — default quality is 'medium', not 'auto'
   network.ts   the heart: rooms, presence, mesh, media, settings sync
-src/App.tsx    landing form (light) + in-room view (dark), video grid, control bar
+src/App.tsx    landing form (light) + in-room view (dark), video grid with
+               click-to-spotlight (gallery ↔ one big tile + filmstrip; Esc or
+               click again to return), control bar, chat panel (side panel on
+               wide screens, overlay ≤700px, unread badge)
 ```
 
 ## Key design decisions
@@ -33,7 +36,12 @@ src/App.tsx    landing form (light) + in-room view (dark), video grid, control b
   AudioContext-destination track / black canvas-capture track), so
   offer/answer stays symmetric and the one-offer, no-renegotiation design
   holds. Unmuting without a real device retries getUserMedia and upgrades the
-  placeholder via `replaceTrack` on every connection.
+  placeholder via `replaceTrack` on every connection. getUserMedia failures
+  surface a cause-specific notice (`mediaErrorMessage`: permission vs
+  not-found vs device-busy, error name included) both at join and on retry —
+  on Linux, a camera held by another browser fails with NotReadableError,
+  which is NOT a permissions problem. The combined audio+video request fails
+  as a whole in that case, so `acquireMedia` retries each kind separately.
 - **Soft cap of 8** (`MAX_PARTICIPANTS`). A peer already holding 7 connections
   answers an unknown peer's announcement/offer with `{t:'room-full'}` on the
   newcomer's topic instead of connecting; a newcomer with zero connections
@@ -54,6 +62,18 @@ src/App.tsx    landing form (light) + in-room view (dark), video grid, control b
   `replaceTrack` per peer; a peer that joins mid-share gets the screen track
   from `outgoingStream()`. Same-kind replacement avoids renegotiation — never
   addTrack mid-connection.
+- **Chat is ephemeral and never relayed.** `{t:'chat', text}` broadcasts on
+  the control channels; every message arrives directly from its author over a
+  channel established via signed signaling, so authorship needs no extra
+  crypto. There is deliberately NO history replay for late joiners — replay
+  would mean peers relaying others' messages, which a malicious peer could
+  fabricate; adding history requires signing each message. Log capped at 500,
+  messages at 2000 chars. Join/left lines are derived locally: hello carries a
+  self-reported `joinedAt`, and a peer whose join predates ours gets no
+  "joined" line on first sight (they were already here) — but `chatSeen`
+  ensures a blip-reconnect logs "joined" to match its "left". Links: only
+  http(s) URLs matched by `withLinks` become anchors (target=_blank,
+  rel=noopener noreferrer); never linkify other schemes.
 - **Cleanup is join-generation-guarded.** `joinSeq` is bumped on every
   join/leave; async work (getUserMedia, topic hashing, display capture)
   re-checks it after each await. `leave()` unsubscribes topics, stops all

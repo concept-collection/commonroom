@@ -1,5 +1,9 @@
 import {useEffect, useRef, useState} from 'react'
-import {MAX_PARTICIPANTS, type ParticipantInfo} from './p2p/network'
+import {
+  MAX_PARTICIPANTS,
+  type ChatItem,
+  type ParticipantInfo
+} from './p2p/network'
 import {VIDEO_QUALITIES, type VideoQuality} from './p2p/settings'
 import {useNetwork} from './useNetwork'
 
@@ -157,6 +161,21 @@ const ICONS = {
       <path d="M16 17l5-5-5-5" />
       <path d="M21 12H9" />
     </>
+  ),
+  chat: (
+    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+  ),
+  x: (
+    <>
+      <path d="M18 6L6 18" />
+      <path d="M6 6l12 12" />
+    </>
+  ),
+  send: (
+    <>
+      <path d="M22 2L11 13" />
+      <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+    </>
   )
 } as const
 
@@ -192,11 +211,13 @@ function Icon({
 function VideoView({
   stream,
   muted,
-  mirror
+  mirror,
+  fit
 }: {
   stream: MediaStream | null
   muted: boolean
   mirror: boolean
+  fit: 'cover' | 'contain'
 }) {
   const ref = useRef<HTMLVideoElement>(null)
   useEffect(() => {
@@ -215,7 +236,7 @@ function VideoView({
         inset: 0,
         width: '100%',
         height: '100%',
-        objectFit: 'cover',
+        objectFit: fit,
         transform: mirror ? 'scaleX(-1)' : undefined
       }}
     />
@@ -229,7 +250,10 @@ function Tile({
   mirror,
   audioMuted,
   videoMuted,
-  connecting
+  connecting,
+  fill = false,
+  onClick,
+  tooltip
 }: {
   stream: MediaStream | null
   label: string
@@ -238,21 +262,35 @@ function Tile({
   audioMuted: boolean
   videoMuted: boolean
   connecting: boolean
+  /** Fill the parent box (spotlight) instead of a fixed 4:3 grid cell. */
+  fill?: boolean
+  onClick?: () => void
+  tooltip?: string
 }) {
   return (
     <div
+      onClick={onClick}
+      title={tooltip}
       style={{
         position: 'relative',
         background: '#000',
         borderRadius: 10,
         overflow: 'hidden',
-        aspectRatio: '4 / 3',
-        border: isSelf ? '1px solid #444' : '1px solid #222'
+        // The spotlight tile letterboxes (contain) so screen shares and faces
+        // are never cropped; grid/filmstrip cells crop to fill (cover).
+        ...(fill ? {width: '100%', height: '100%'} : {aspectRatio: '4 / 3'}),
+        border: isSelf ? '1px solid #444' : '1px solid #222',
+        cursor: onClick ? 'pointer' : undefined
       }}
     >
       {/* The video element stays mounted even when their camera is off so the
           audio keeps playing; the placeholder just covers it. */}
-      <VideoView stream={stream} muted={isSelf} mirror={mirror} />
+      <VideoView
+        stream={stream}
+        muted={isSelf}
+        mirror={mirror}
+        fit={fill ? 'contain' : 'cover'}
+      />
       {(videoMuted || connecting) && (
         <div
           style={{
@@ -435,17 +473,210 @@ function CopyLinkButton({compact}: {compact: boolean}) {
   )
 }
 
-function ParticipantTile({p}: {p: ParticipantInfo}) {
+// ---- chat -----------------------------------------------------------------
+
+const useMediaQuery = (query: string): boolean => {
+  const [matches, setMatches] = useState(() => matchMedia(query).matches)
+  useEffect(() => {
+    const mq = matchMedia(query)
+    const onChange = () => setMatches(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [query])
+  return matches
+}
+
+// Make http(s) URLs clickable. Only URLs we matched ourselves become hrefs
+// (never arbitrary schemes), and common trailing punctuation stays as text.
+const URL_RE = /https?:\/\/[^\s]+/g
+
+function withLinks(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = []
+  let last = 0
+  let m: RegExpExecArray | null
+  URL_RE.lastIndex = 0
+  while ((m = URL_RE.exec(text))) {
+    let url = m[0]
+    const trail = url.match(/[.,!?;:)\]'"]+$/)
+    if (trail) url = url.slice(0, -trail[0].length)
+    if (url.replace(/^https?:\/\//, '') === '') continue // scheme only
+    if (m.index > last) out.push(text.slice(last, m.index))
+    out.push(
+      <a
+        key={m.index}
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{color: '#9cc4ff', wordBreak: 'break-all'}}
+      >
+        {url}
+      </a>
+    )
+    last = m.index + url.length
+    URL_RE.lastIndex = last
+  }
+  if (last < text.length) out.push(text.slice(last))
+  return out
+}
+
+const timeLabel = (t: number): string =>
+  new Date(t).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+
+function ChatPanel({
+  items,
+  overlay,
+  onSend,
+  onClose
+}: {
+  items: ChatItem[]
+  overlay: boolean
+  onSend: (text: string) => void
+  onClose: () => void
+}) {
+  const [draft, setDraft] = useState('')
+  const listRef = useRef<HTMLDivElement>(null)
+  // Stick to the bottom unless the user has scrolled up to read.
+  const stickRef = useRef(true)
+  useEffect(() => {
+    const el = listRef.current
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight
+  }, [items.length])
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!draft.trim()) return
+    onSend(draft)
+    setDraft('')
+    stickRef.current = true
+  }
+
   return (
-    <Tile
-      stream={p.stream}
-      label={p.name}
-      isSelf={false}
-      mirror={false}
-      audioMuted={p.audioMuted}
-      videoMuted={p.videoMuted}
-      connecting={!p.connected}
-    />
+    <aside
+      style={{
+        ...(overlay
+          ? {
+              position: 'absolute',
+              top: 0,
+              right: 0,
+              bottom: 0,
+              width: 'min(320px, 88vw)',
+              zIndex: 10,
+              boxShadow: '-4px 0 16px rgba(0, 0, 0, 0.5)'
+            }
+          : {width: 300, flex: '0 0 auto'}),
+        background: '#161616',
+        borderLeft: '1px solid #333',
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: 0
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          padding: '0.45rem 0.45rem 0.45rem 0.75rem',
+          borderBottom: '1px solid #333'
+        }}
+      >
+        <strong>Chat</strong>
+        <button
+          style={{...iconBtn, padding: '0.35rem', border: 'none', background: 'none'}}
+          onClick={onClose}
+          title="Close chat"
+          aria-label="Close chat"
+        >
+          <Icon name="x" size={16} />
+        </button>
+      </div>
+      <div
+        ref={listRef}
+        onScroll={() => {
+          const el = listRef.current
+          if (el) {
+            stickRef.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 60
+          }
+        }}
+        style={{flex: 1, minHeight: 0, overflowY: 'auto', padding: '0.6rem 0.75rem'}}
+      >
+        {items.length === 0 && (
+          <p style={{color: '#777', fontSize: '0.85rem'}}>
+            No messages yet. Only people in the room see the chat, and nothing
+            is stored anywhere.
+          </p>
+        )}
+        {items.map(item =>
+          item.kind === 'system' ? (
+            <div
+              key={item.seq}
+              style={{
+                textAlign: 'center',
+                color: '#888',
+                fontStyle: 'italic',
+                fontSize: '0.8rem',
+                margin: '0.45rem 0'
+              }}
+            >
+              {item.text} · {timeLabel(item.time)}
+            </div>
+          ) : (
+            <div key={item.seq} style={{marginBottom: '0.55rem'}}>
+              <div style={{fontSize: '0.75rem', color: '#888'}}>
+                <strong style={{color: '#ccc'}}>{item.name}</strong>{' '}
+                {timeLabel(item.time)}
+              </div>
+              <div
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontSize: '0.92rem'
+                }}
+              >
+                {withLinks(item.text)}
+              </div>
+            </div>
+          )
+        )}
+      </div>
+      <form
+        onSubmit={submit}
+        style={{
+          display: 'flex',
+          gap: '0.4rem',
+          padding: '0.6rem',
+          borderTop: '1px solid #333'
+        }}
+      >
+        <input
+          autoFocus
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          placeholder="Message…"
+          maxLength={2000}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: '0.45rem 0.6rem',
+            borderRadius: 8,
+            border: '1px solid #555',
+            background: '#2a2a2a',
+            color: '#eee',
+            fontSize: '0.92rem'
+          }}
+        />
+        <button
+          type="submit"
+          style={draft.trim() ? iconBtn : {...iconBtn, ...disabledStyle}}
+          disabled={!draft.trim()}
+          title="Send"
+          aria-label="Send message"
+        >
+          <Icon name="send" size={16} />
+        </button>
+      </form>
+    </aside>
   )
 }
 
@@ -463,8 +694,49 @@ export default function App() {
     localStream,
     screenStream,
     settings,
+    chat,
     notice
   } = snapshot
+
+  // Spotlight: which tile is enlarged ('self', a peer ID, or null = gallery).
+  const [focusedId, setFocusedId] = useState<string | null>(null)
+  const focusValid =
+    focusedId !== null &&
+    (focusedId === 'self' || participants.some(p => p.peerId === focusedId))
+  const focus = focusValid ? focusedId : null
+  useEffect(() => {
+    // Drop the spotlight when its subject leaves (or we leave the room).
+    if (focusedId !== null && (phase !== 'room' || !focusValid)) {
+      setFocusedId(null)
+    }
+  }, [phase, focusedId, focusValid])
+  useEffect(() => {
+    if (!focus) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setFocusedId(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [focus])
+
+  // Chat panel: side panel on wide screens, overlay on narrow ones. The
+  // unread badge counts real messages (not join/left lines) that arrived
+  // while the panel was closed.
+  const [chatOpen, setChatOpen] = useState(false)
+  const [readCount, setReadCount] = useState(0)
+  const narrow = useMediaQuery('(max-width: 700px)')
+  useEffect(() => {
+    if (phase !== 'room' && chatOpen) setChatOpen(false)
+  }, [phase, chatOpen])
+  useEffect(() => {
+    // Follows the log while open; also snaps back when the log resets on leave.
+    if ((chatOpen || readCount > chat.length) && readCount !== chat.length) {
+      setReadCount(chat.length)
+    }
+  }, [chatOpen, readCount, chat.length])
+  const unread = chatOpen
+    ? 0
+    : chat.slice(readCount).filter(m => m.kind === 'chat').length
 
   if (phase === 'landing') {
     return (
@@ -503,6 +775,44 @@ export default function App() {
   const sharing = screenStream !== null
   const count = participants.length + 1
   const alone = participants.length === 0
+
+  const tileTooltip = (focused: boolean) =>
+    focused ? 'Click to return to the gallery (Esc)' : 'Click to enlarge'
+  const selfTile = (focused: boolean) => (
+    <Tile
+      stream={screenStream ?? localStream}
+      label={`${name} (you)`}
+      isSelf
+      mirror={!sharing}
+      audioMuted={audioMuted}
+      videoMuted={videoMuted && !sharing}
+      connecting={false}
+      fill={focused}
+      tooltip={tileTooltip(focused)}
+      onClick={() => setFocusedId(focused ? null : 'self')}
+    />
+  )
+  const peerTile = (p: ParticipantInfo, focused: boolean) => (
+    <Tile
+      stream={p.stream}
+      label={p.name}
+      isSelf={false}
+      mirror={false}
+      audioMuted={p.audioMuted}
+      videoMuted={p.videoMuted}
+      connecting={!p.connected}
+      fill={focused}
+      tooltip={tileTooltip(focused)}
+      onClick={() => setFocusedId(focused ? null : p.peerId)}
+    />
+  )
+  const focusedPeer =
+    focus && focus !== 'self'
+      ? participants.find(p => p.peerId === focus)
+      : undefined
+  const stripPeers = focus
+    ? participants.filter(p => p.peerId !== focus)
+    : []
 
   return (
     <div
@@ -554,7 +864,24 @@ export default function App() {
         </button>
       </header>
 
-      <main style={{flex: 1, overflowY: 'auto', padding: '1rem'}}>
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          position: 'relative'
+        }}
+      >
+      <main
+        style={{
+          flex: 1,
+          minWidth: 0,
+          overflowY: focus ? 'hidden' : 'auto',
+          padding: '1rem',
+          display: 'flex',
+          flexDirection: 'column'
+        }}
+      >
         {notice && (
           <div
             style={{
@@ -578,61 +905,108 @@ export default function App() {
           </div>
         )}
 
-        <div
-          style={{
-            display: 'grid',
-            gap: '0.75rem',
-            gridTemplateColumns: alone
-              ? 'minmax(0, 480px)'
-              : 'repeat(auto-fit, minmax(min(280px, 100%), 1fr))',
-            justifyContent: 'center',
-            maxWidth: 1100,
-            margin: '0 auto'
-          }}
-        >
-          <Tile
-            stream={screenStream ?? localStream}
-            label={`${name} (you)`}
-            isSelf
-            mirror={!sharing}
-            audioMuted={audioMuted}
-            videoMuted={videoMuted && !sharing}
-            connecting={false}
-          />
-          {participants.map(p => (
-            <ParticipantTile key={p.peerId} p={p} />
-          ))}
-        </div>
-
-        {alone && (
-          <div
-            style={{
-              maxWidth: 480,
-              margin: '1.25rem auto 0',
-              background: '#1c1c1c',
-              border: '1px solid #333',
-              borderRadius: 10,
-              padding: '1rem',
-              textAlign: 'center'
-            }}
-          >
-            <p style={{marginTop: 0}}>
-              You're the only one here. Share this link so others can join:
-            </p>
-            <p
+        {focus ? (
+          <>
+            {/* Spotlight: the chosen tile takes the available space… */}
+            <div style={{flex: 1, minHeight: 0}}>
+              {focus === 'self'
+                ? selfTile(true)
+                : focusedPeer && peerTile(focusedPeer, true)}
+            </div>
+            {/* …and everyone else shrinks to a filmstrip below it. */}
+            {(focus !== 'self' || stripPeers.length > 0) && (
+              <div
+                style={{
+                  overflowX: 'auto',
+                  flex: '0 0 auto',
+                  marginTop: '0.75rem'
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: '0.5rem',
+                    width: 'max-content',
+                    margin: '0 auto'
+                  }}
+                >
+                  {focus !== 'self' && (
+                    <div style={{width: 150, flex: '0 0 auto'}}>
+                      {selfTile(false)}
+                    </div>
+                  )}
+                  {stripPeers.map(p => (
+                    <div key={p.peerId} style={{width: 150, flex: '0 0 auto'}}>
+                      {peerTile(p, false)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div
               style={{
-                color: '#9cc4ff',
-                wordBreak: 'break-all',
-                fontSize: '0.9rem',
-                userSelect: 'all'
+                display: 'grid',
+                gap: '0.75rem',
+                gridTemplateColumns: alone
+                  ? 'minmax(0, 480px)'
+                  : 'repeat(auto-fit, minmax(min(280px, 100%), 1fr))',
+                justifyContent: 'center',
+                maxWidth: 1100,
+                width: '100%',
+                margin: '0 auto'
               }}
             >
-              {location.href}
-            </p>
-            <CopyLinkButton compact={false} />
-          </div>
+              {selfTile(false)}
+              {participants.map(p => (
+                <div key={p.peerId} style={{minWidth: 0}}>
+                  {peerTile(p, false)}
+                </div>
+              ))}
+            </div>
+
+            {alone && (
+              <div
+                style={{
+                  maxWidth: 480,
+                  margin: '1.25rem auto 0',
+                  background: '#1c1c1c',
+                  border: '1px solid #333',
+                  borderRadius: 10,
+                  padding: '1rem',
+                  textAlign: 'center'
+                }}
+              >
+                <p style={{marginTop: 0}}>
+                  You're the only one here. Share this link so others can join:
+                </p>
+                <p
+                  style={{
+                    color: '#9cc4ff',
+                    wordBreak: 'break-all',
+                    fontSize: '0.9rem',
+                    userSelect: 'all'
+                  }}
+                >
+                  {location.href}
+                </p>
+                <CopyLinkButton compact={false} />
+              </div>
+            )}
+          </>
         )}
       </main>
+      {chatOpen && (
+        <ChatPanel
+          items={chat}
+          overlay={narrow}
+          onSend={text => network.sendChat(text)}
+          onClose={() => setChatOpen(false)}
+        />
+      )}
+      </div>
 
       <footer
         style={{
@@ -688,6 +1062,38 @@ export default function App() {
             <Icon name="monitor" />
           </button>
         )}
+        <span style={{position: 'relative', display: 'inline-flex'}}>
+          <button
+            style={chatOpen ? {...iconBtn, background: '#3a3a3a'} : iconBtn}
+            title={chatOpen ? 'Close the chat' : 'Open the chat'}
+            aria-label={chatOpen ? 'Close the chat' : 'Open the chat'}
+            onClick={() => setChatOpen(!chatOpen)}
+          >
+            <Icon name="chat" />
+          </button>
+          {unread > 0 && (
+            <span
+              style={{
+                position: 'absolute',
+                top: -5,
+                right: -5,
+                minWidth: 18,
+                height: 18,
+                borderRadius: 9,
+                background: '#c62828',
+                color: '#fff',
+                fontSize: '0.7rem',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '0 4px',
+                pointerEvents: 'none'
+              }}
+            >
+              {unread > 99 ? '99+' : unread}
+            </span>
+          )}
+        </span>
         <label
           title="Video quality for the whole room — anyone can change it, and it applies to everyone"
           style={{

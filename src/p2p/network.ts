@@ -54,10 +54,15 @@ type ControlMsg =
       name: string
       audioMuted: boolean
       videoMuted: boolean
+      /** Self-reported epoch ms of when they entered the room, so receivers
+       *  can tell "was already here when I arrived" from "joined after me"
+       *  for the chat's join lines. */
+      joinedAt: number
       settings: SettingEntry[]
     }
   | ({t: 'set'} & SettingEntry)
   | {t: 'mute'; audio: boolean; video: boolean}
+  | {t: 'chat'; text: string}
   | {t: 'bye'}
 
 const ANNOUNCE_INTERVAL_MS = 5000
@@ -69,6 +74,9 @@ const PRESENCE_TTL_MS = 15000
 const CONNECT_RETRY_MS = 15000
 
 const NAME_KEY = 'commonroom:name'
+
+const CHAT_MAX_LENGTH = 2000
+const CHAT_LOG_CAP = 500
 
 export type Phase = 'landing' | 'joining' | 'room'
 
@@ -84,6 +92,18 @@ interface Conn {
    *  — everyone starts muted). */
   audioMuted: boolean
   videoMuted: boolean
+}
+
+export interface ChatItem {
+  /** Monotonic per-session sequence number; stable React key. */
+  seq: number
+  kind: 'chat' | 'system'
+  /** The author's peer ID; null for system lines. */
+  peerId: string | null
+  name: string
+  text: string
+  /** Local arrival time (epoch ms). */
+  time: number
 }
 
 export interface ParticipantInfo {
@@ -109,6 +129,7 @@ export interface Snapshot {
   localStream: MediaStream | null
   screenStream: MediaStream | null
   settings: RoomSettings
+  chat: ChatItem[]
   notice: string | null
 }
 
@@ -139,6 +160,19 @@ export class Network {
   private settingsMeta: Partial<
     Record<keyof RoomSettings, {rev: number; by: string}>
   > = {}
+
+  // Chat is ephemeral: you only see what's said while you're in the room.
+  // Messages arrive directly from their author over the authenticated
+  // channel, so there's no relaying and nothing to forge.
+  private chat: ChatItem[] = []
+  private chatSeq = 0
+  /** When WE entered the room (epoch ms), reported in our hello. */
+  private joinedAtMs = 0
+  /** peerId -> name for peers currently counted present in the chat. */
+  private chatPresent = new Map<string, string>()
+  /** Peers we've ever logged a join/left line for (so a reconnect after a
+   *  network blip gets a "joined" line to match its "left" line). */
+  private chatSeen = new Set<string>()
 
   private notice: string | null = null
 
@@ -187,6 +221,15 @@ export class Network {
     this.localStream = media.stream
     this.micAvailable = media.mic
     this.camAvailable = media.cam
+    // Tell the user right away when a device didn't come up (and why), so
+    // they aren't surprised at unmute time.
+    if (!media.mic && !media.cam) {
+      this.notice = `${mediaErrorMessage('camera or microphone', media.camError)} You've still joined — the mic/camera buttons will retry.`
+    } else if (!media.cam) {
+      this.notice = `${mediaErrorMessage('camera', media.camError)} The camera button will retry.`
+    } else if (!media.mic) {
+      this.notice = `${mediaErrorMessage('microphone', media.micError)} The mic button will retry.`
+    }
     // Everyone enters muted.
     this.audioMuted = true
     this.videoMuted = true
@@ -231,6 +274,8 @@ export class Network {
     )
 
     this.phase = 'room'
+    this.joinedAtMs = Date.now()
+    this.pushSystem('You joined')
     void this.announce()
     this.announceTimer = window.setInterval(
       () => void this.announce(),
@@ -280,6 +325,9 @@ export class Network {
     this.videoMuted = true
     this.settings = {...DEFAULT_SETTINGS}
     this.settingsMeta = {}
+    this.chat = []
+    this.chatPresent.clear()
+    this.chatSeen.clear()
     this.root = ''
     this.roomId = null
     this.phase = 'landing'
@@ -297,34 +345,40 @@ export class Network {
     stream: MediaStream
     mic: boolean
     cam: boolean
+    micError: unknown
+    camError: unknown
   }> {
     try {
       const s = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: true
       })
-      return {stream: s, mic: true, cam: true}
+      return {stream: s, mic: true, cam: true, micError: null, camError: null}
     } catch {
-      /* fall through to per-kind attempts */
+      // The combined request fails as a whole if EITHER device is unusable
+      // (in Firefox, e.g., a camera held by another app fails it even though
+      // the mic is fine) — retry each kind on its own to keep what works.
     }
     let audio: MediaStreamTrack | null = null
     let video: MediaStreamTrack | null = null
+    let micError: unknown = null
+    let camError: unknown = null
     try {
       const s = await navigator.mediaDevices.getUserMedia({audio: true})
       audio = s.getAudioTracks()[0] ?? null
-    } catch {
-      /* no mic */
+    } catch (err) {
+      micError = err
     }
     try {
       const s = await navigator.mediaDevices.getUserMedia({video: true})
       video = s.getVideoTracks()[0] ?? null
-    } catch {
-      /* no camera */
+    } catch (err) {
+      camError = err
     }
     const stream = new MediaStream()
     stream.addTrack(audio ?? this.silentAudioTrack())
     stream.addTrack(video ?? blackVideoTrack())
-    return {stream, mic: audio !== null, cam: video !== null}
+    return {stream, mic: audio !== null, cam: video !== null, micError, camError}
   }
 
   private silentAudioTrack(): MediaStreamTrack {
@@ -426,6 +480,11 @@ export class Network {
       close: () => {
         if (this.conns.get(peerId) === conn) {
           this.conns.delete(peerId)
+          const chatName = this.chatPresent.get(peerId)
+          if (chatName !== undefined) {
+            this.chatPresent.delete(peerId)
+            this.pushSystem(`${chatName} left`)
+          }
           this.rebuildSnapshot()
         }
       }
@@ -488,6 +547,7 @@ export class Network {
         name: this.name ?? '',
         audioMuted: this.audioMuted,
         videoMuted: this.effectiveVideoMuted(),
+        joinedAt: this.joinedAtMs,
         settings
       } satisfies ControlMsg)
     )
@@ -509,6 +569,21 @@ export class Network {
         if (Array.isArray(msg.settings)) {
           for (const entry of msg.settings) this.applyRemoteSetting(entry)
         }
+        if (!this.chatPresent.has(peerId)) {
+          const name =
+            this.presence.get(peerId)?.name ??
+            conn.name ??
+            peerId.slice(0, 8)
+          // No join line for people who were already here when we arrived
+          // (their self-reported join predates ours) — unless we've logged a
+          // "left" for them before, in which case this is a return.
+          const joinedAt = typeof msg.joinedAt === 'number' ? msg.joinedAt : 0
+          const preexisting =
+            joinedAt <= this.joinedAtMs && !this.chatSeen.has(peerId)
+          this.chatPresent.set(peerId, name)
+          this.chatSeen.add(peerId)
+          if (!preexisting) this.pushSystem(`${name} joined`)
+        }
         this.rebuildSnapshot()
         return
       }
@@ -525,12 +600,54 @@ export class Network {
         this.rebuildSnapshot()
         return
       }
+      case 'chat': {
+        if (typeof msg.text !== 'string') return
+        const text = msg.text.slice(0, CHAT_MAX_LENGTH)
+        if (!text.trim()) return
+        this.pushChatItem({
+          kind: 'chat',
+          peerId,
+          name:
+            this.presence.get(peerId)?.name ?? conn.name ?? peerId.slice(0, 8),
+          text
+        })
+        this.rebuildSnapshot()
+        return
+      }
       case 'bye': {
         this.presence.delete(peerId)
         conn.peer.destroy() // its close handler removes it and rebuilds
         return
       }
     }
+  }
+
+  // ---- chat ------------------------------------------------------------------
+
+  private pushChatItem(item: Omit<ChatItem, 'seq' | 'time'>) {
+    this.chat.push({...item, seq: this.chatSeq++, time: Date.now()})
+    if (this.chat.length > CHAT_LOG_CAP) {
+      this.chat.splice(0, this.chat.length - CHAT_LOG_CAP)
+    }
+  }
+
+  private pushSystem(text: string) {
+    this.pushChatItem({kind: 'system', peerId: null, name: '', text})
+  }
+
+  /** Send a chat message to everyone in the room (and our own log). */
+  sendChat(text: string) {
+    if (this.phase !== 'room') return
+    const trimmed = text.trim().slice(0, CHAT_MAX_LENGTH)
+    if (!trimmed) return
+    this.broadcastControl({t: 'chat', text: trimmed})
+    this.pushChatItem({
+      kind: 'chat',
+      peerId: selfId,
+      name: this.name ?? '',
+      text: trimmed
+    })
+    this.rebuildSnapshot()
   }
 
   // ---- shared room settings ------------------------------------------------
@@ -651,9 +768,8 @@ export class Network {
     let stream: MediaStream
     try {
       stream = await navigator.mediaDevices.getUserMedia({audio: true})
-    } catch {
-      this.notice =
-        'Could not access your microphone — check browser permissions.'
+    } catch (err) {
+      this.notice = mediaErrorMessage('microphone', err)
       this.rebuildSnapshot()
       return
     }
@@ -683,8 +799,8 @@ export class Network {
     let stream: MediaStream
     try {
       stream = await navigator.mediaDevices.getUserMedia({video: true})
-    } catch {
-      this.notice = 'Could not access your camera — check browser permissions.'
+    } catch (err) {
+      this.notice = mediaErrorMessage('camera', err)
       this.rebuildSnapshot()
       return
     }
@@ -829,9 +945,31 @@ export class Network {
       localStream: this.localStream,
       screenStream: this.screenStream,
       settings: this.settings,
+      chat: this.chat,
       notice: this.notice
     }
     for (const l of this.listeners) l()
+  }
+}
+
+/** A human-readable reason for a getUserMedia failure. The error name is
+ *  included so the real cause is visible — "permission denied" and "another
+ *  app is holding the camera" need entirely different fixes. */
+const mediaErrorMessage = (what: string, err: unknown): string => {
+  const rawName = (err as {name?: unknown} | null)?.name
+  const name = typeof rawName === 'string' ? rawName : ''
+  switch (name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return `Access to your ${what} was blocked — check this site's permissions in your browser.`
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return `No ${what} was found on this device.`
+    case 'NotReadableError':
+    case 'AbortError':
+      return `Your ${what} could not be started — it may be in use by another app or browser (${name}).`
+    default:
+      return `Could not access your ${what}${name ? ` (${name})` : ''}.`
   }
 }
 
